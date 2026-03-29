@@ -1,9 +1,6 @@
 {
   "profiles": {
-    "PriorityPulse (Package)": {
-      "commandName": "MsixPackage"
-    },
-    "PriorityPulse (Unpackaged)": {
+    "PriorityPulse": {
       "commandName": "Project"
     }
   }
