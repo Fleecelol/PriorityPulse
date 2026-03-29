@@ -13,7 +13,7 @@
                 <Setter Property="FontFamily" Value="Segoe UI Variable Display"/>
             </Style>
 
-            <!-- macOS-style window control dots -->
+            <!-- window control dots -->
             <Style x:Key="MacDotStyle" TargetType="Button">
                 <Setter Property="Width"  Value="12"/>
                 <Setter Property="Height" Value="12"/>
@@ -62,23 +62,8 @@
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <!-- Title bar with dot controls (right-aligned: minimize, maximize, close) -->
-        <Grid x:Name="AppTitleBar" Grid.Row="0">
-            <StackPanel Orientation="Horizontal"
-                        HorizontalAlignment="Right"
-                        VerticalAlignment="Center"
-                        Margin="0,0,16,0" Spacing="8">
-                <Button Style="{StaticResource MacDotStyle}" Background="#FEBC2E"
-                        Click="TitleMinBtn_Click"   ToolTipService.ToolTip="Minimize"/>
-                <Button Style="{StaticResource MacDotStyle}" Background="#28C840"
-                        Click="TitleMaxBtn_Click"   ToolTipService.ToolTip="Maximize"/>
-                <Button Style="{StaticResource MacDotStyle}" Background="#FF5F57"
-                        Click="TitleCloseBtn_Click" ToolTipService.ToolTip="Close"/>
-            </StackPanel>
-        </Grid>
-
-        <!-- Navigation sidebar -->
-        <NavigationView x:Name="AppNavView" Grid.Row="1"
+        <!-- sidebar — full height -->
+        <NavigationView x:Name="AppNavView" Grid.Row="0" Grid.RowSpan="2"
                         PaneDisplayMode="LeftCompact"
                         IsBackButtonVisible="Collapsed"
                         IsSettingsVisible="False"
@@ -96,7 +81,7 @@
             </NavigationView.Resources>
 
             <NavigationView.PaneHeader>
-                <StackPanel Margin="16,10,12,20" Spacing="4">
+                <StackPanel Margin="16,44,12,20" Spacing="4">
                     <TextBlock x:Name="AppTitleText" Text="PriorityPulse"
                                FontSize="22" FontWeight="SemiBold"/>
                     <TextBlock x:Name="AppSubtitleText"
@@ -111,16 +96,24 @@
                 <NavigationViewItem Content="Settings"   Tag="Settings"  Icon="Setting"/>
             </NavigationView.MenuItems>
 
-            <!-- Page content area -->
-            <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <!-- page content -->
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="0,36,0,0">
                 <Grid Padding="30">
                     <StackPanel Spacing="20">
                         <StackPanel Spacing="6">
                             <TextBlock x:Name="PageTitleText" Text="Target App"
-                                       FontSize="32" FontWeight="SemiBold"/>
+                                       FontSize="32" FontWeight="SemiBold">
+                                <TextBlock.RenderTransform>
+                                    <TranslateTransform x:Name="PageTitleTransform"/>
+                                </TextBlock.RenderTransform>
+                            </TextBlock>
                             <TextBlock x:Name="PageSubtitleText"
                                        Text="Choose which executables PriorityPulse should monitor."
-                                       FontSize="13" Opacity="0.7"/>
+                                       FontSize="13" Opacity="0.7">
+                                <TextBlock.RenderTransform>
+                                    <TranslateTransform x:Name="PageSubtitleTransform"/>
+                                </TextBlock.RenderTransform>
+                            </TextBlock>
                         </StackPanel>
                         <StackPanel x:Name="PageContentHost" Spacing="18">
                             <StackPanel.RenderTransform>
@@ -131,5 +124,20 @@
                 </Grid>
             </ScrollViewer>
         </NavigationView>
+
+        <!-- title bar drag region — offset to keep hamburger clickable -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Canvas.ZIndex="2" Margin="48,0,0,0">
+            <StackPanel Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Center"
+                        Margin="0,0,16,0" Spacing="8">
+                <Button Style="{StaticResource MacDotStyle}" Background="#FEBC2E"
+                        Click="TitleMinBtn_Click"   ToolTipService.ToolTip="Minimize"/>
+                <Button Style="{StaticResource MacDotStyle}" Background="#28C840"
+                        Click="TitleMaxBtn_Click"   ToolTipService.ToolTip="Maximize"/>
+                <Button Style="{StaticResource MacDotStyle}" Background="#FF5F57"
+                        Click="TitleCloseBtn_Click" ToolTipService.ToolTip="Close"/>
+            </StackPanel>
+        </Grid>
     </Grid>
 </Window>
