@@ -8,11 +8,11 @@ using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Windows.Storage;
 using Windows.Storage.Pickers;
 using WinRT.Interop;
 
@@ -20,7 +20,7 @@ namespace PriorityPulse
 {
     public sealed partial class MainWindow : Window
     {
-        // ── App State ──
+        // ── state ──
         private readonly HashSet<string>               _targetApps    = new(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<int>                  _handledPids   = new();
         private readonly List<(string Ts, string Msg)> _consoleLogs   = new();
@@ -33,30 +33,53 @@ namespace PriorityPulse
         private bool   _minimizeToTray  = true;
         private string _defaultPriority = "High";
         private int    _defaultCheckMs  = 150;
+        private int    _autoClearLimit  = 0;
         private TrayIcon? _trayIcon;
 
-        // ── Constants ──
+        // ── constants ──
         private static readonly string[] Priorities = { "Normal", "AboveNormal", "High" };
+
         private static readonly (string Label, int Ms)[] CheckIntervals =
         {
             ("50ms", 50), ("100ms", 100), ("150ms", 150), ("250ms", 250), ("500ms", 500),
             ("1s", 1000), ("2s", 2000), ("5s", 5000), ("10s", 10000),
         };
 
+        private static readonly (string Label, int Count)[] AutoClearOptions =
+        {
+            ("Never", 0), ("50 entries", 50), ("100 entries", 100),
+            ("250 entries", 250), ("500 entries", 500), ("1000 entries", 1000),
+        };
+
         private const string RegKeyName = "PriorityPulse";
         private const string RegPath    = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+
+        // ── persistence paths ──
+        private static readonly string DataFolder   = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PriorityPulse");
+        private static readonly string AppsFile     = Path.Combine(DataFolder, "apps.json");
+        private static readonly string SettingsFile = Path.Combine(DataFolder, "settings.json");
 
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
 
-        // ── Serialization Model ──
+        // ── serialization models ──
         private class AppConfig
         {
             public string Priority { get; set; } = "High";
             public int    CheckMs  { get; set; } = 150;
         }
 
-        // ── Initialization ──
+        private class SettingsData
+        {
+            public bool   IsDarkMode      { get; set; } = true;
+            public bool   MinimizeToTray  { get; set; } = true;
+            public string DefaultPriority { get; set; } = "High";
+            public int    DefaultCheckMs  { get; set; } = 150;
+            public int    AutoClearLimit  { get; set; } = 0;
+        }
+
+        // ── init ──
         public MainWindow()
         {
             InitializeComponent();
@@ -68,15 +91,16 @@ namespace PriorityPulse
 
             ExtendsContentIntoTitleBar = true;
             SetTitleBar(AppTitleBar);
+            LoadSettings();
+            LoadAppData();
             ApplyTheme();
-            _ = LoadAppDataAsync();
             InitTray();
 
             var hwnd = WindowNative.GetWindowHandle(this);
             if (_trayIcon != null)
             {
-                SendMessage(hwnd, 0x0080, new IntPtr(1), _trayIcon.IconHandle);
-                SendMessage(hwnd, 0x0080, new IntPtr(0), _trayIcon.IconHandle);
+                SendMessage(hwnd, 0x0080, (IntPtr)1, _trayIcon.IconHandle);
+                SendMessage(hwnd, 0x0080, IntPtr.Zero, _trayIcon.IconHandle);
             }
 
             AppNavView.SelectedItem = AppNavView.MenuItems[0];
@@ -90,7 +114,7 @@ namespace PriorityPulse
             };
         }
 
-        // ── Title Bar Dot Buttons ──
+        // ── title bar controls ──
         private void TitleCloseBtn_Click(object s, RoutedEventArgs e)
         {
             if (_minimizeToTray) AppWindow.Hide();
@@ -111,7 +135,7 @@ namespace PriorityPulse
             }
         }
 
-        // ── System Tray ──
+        // ── system tray ──
         private void InitTray()
         {
             var hwnd = WindowNative.GetWindowHandle(this);
@@ -120,45 +144,75 @@ namespace PriorityPulse
             _trayIcon.ExitRequested += () => { _trayIcon?.Dispose(); Application.Current.Exit(); };
         }
 
-        // ── Persistence (apps.json in LocalFolder) ──
-        private async Task LoadAppDataAsync()
+        // ── app data persistence ──
+        private void LoadAppData()
         {
             try
             {
-                var file = await ApplicationData.Current.LocalFolder.GetFileAsync("apps.json");
-                var data = JsonSerializer.Deserialize<Dictionary<string, AppConfig>>(await FileIO.ReadTextAsync(file));
+                if (!File.Exists(AppsFile)) return;
+                var data = JsonSerializer.Deserialize<Dictionary<string, AppConfig>>(File.ReadAllText(AppsFile));
                 if (data == null) return;
-                DispatcherQueue.TryEnqueue(() =>
+                foreach (var (name, cfg) in data)
                 {
-                    foreach (var (name, cfg) in data)
-                    {
-                        _targetApps.Add(name);
-                        _appPriorities[name] = cfg.Priority;
-                        _appCheckTimes[name] = cfg.CheckMs;
-                    }
-                    ShowTargetAppPage();
-                });
+                    _targetApps.Add(name);
+                    _appPriorities[name] = cfg.Priority;
+                    _appCheckTimes[name] = cfg.CheckMs;
+                }
             }
             catch { }
         }
 
-        private async Task SaveAppDataAsync()
+        private void SaveAppData()
         {
             try
             {
+                Directory.CreateDirectory(DataFolder);
                 var data = _targetApps.ToDictionary(a => a, a => new AppConfig
                 {
                     Priority = _appPriorities.GetValueOrDefault(a, "High"),
                     CheckMs  = _appCheckTimes.GetValueOrDefault(a, 150)
                 });
-                var file = await ApplicationData.Current.LocalFolder
-                    .CreateFileAsync("apps.json", CreationCollisionOption.ReplaceExisting);
-                await FileIO.WriteTextAsync(file, JsonSerializer.Serialize(data));
+                File.WriteAllText(AppsFile, JsonSerializer.Serialize(data));
             }
             catch { }
         }
 
-        // ── Auto-Start Registry ──
+        // ── settings persistence ──
+        private void LoadSettings()
+        {
+            try
+            {
+                if (!File.Exists(SettingsFile)) return;
+                var s = JsonSerializer.Deserialize<SettingsData>(File.ReadAllText(SettingsFile));
+                if (s == null) return;
+                _isDarkMode      = s.IsDarkMode;
+                _minimizeToTray  = s.MinimizeToTray;
+                _defaultPriority = s.DefaultPriority;
+                _defaultCheckMs  = s.DefaultCheckMs;
+                _autoClearLimit  = s.AutoClearLimit;
+            }
+            catch { }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(DataFolder);
+                var s = new SettingsData
+                {
+                    IsDarkMode      = _isDarkMode,
+                    MinimizeToTray  = _minimizeToTray,
+                    DefaultPriority = _defaultPriority,
+                    DefaultCheckMs  = _defaultCheckMs,
+                    AutoClearLimit  = _autoClearLimit
+                };
+                File.WriteAllText(SettingsFile, JsonSerializer.Serialize(s));
+            }
+            catch { }
+        }
+
+        // ── auto-start ──
         private bool GetAutoStart()
         {
             try { using var k = Registry.CurrentUser.OpenSubKey(RegPath); return k?.GetValue(RegKeyName) != null; }
@@ -176,16 +230,16 @@ namespace PriorityPulse
             catch { }
         }
 
-        // ── Theme / Brushes ──
-        private Brush CardBg     => new SolidColorBrush(_isDarkMode ? ColorHelper.FromArgb(28, 255, 255, 255) : ColorHelper.FromArgb(150, 255, 255, 255));
-        private Brush CardBorder => new SolidColorBrush(_isDarkMode ? ColorHelper.FromArgb(55, 255, 255, 255) : ColorHelper.FromArgb(80, 0, 0, 0));
+        // ── theme ──
+        private Brush CardBg     => new SolidColorBrush(_isDarkMode ? ColorHelper.FromArgb(32, 255, 255, 255) : ColorHelper.FromArgb(160, 255, 255, 255));
+        private Brush CardBorder => new SolidColorBrush(_isDarkMode ? ColorHelper.FromArgb(65, 255, 255, 255) : ColorHelper.FromArgb(90, 0, 0, 0));
         private Brush TextPri    => new SolidColorBrush(_isDarkMode ? Colors.White : Colors.Black);
         private Brush TextSec    => new SolidColorBrush(_isDarkMode ? ColorHelper.FromArgb(180, 255, 255, 255) : ColorHelper.FromArgb(160, 0, 0, 0));
 
-        private void SetBrush(ResourceDictionary res, string key, Windows.UI.Color color)
+        private void SetBrush(ResourceDictionary res, string key, Windows.UI.Color c)
         {
-            if (res.TryGetValue(key, out var v) && v is SolidColorBrush b) b.Color = color;
-            else res[key] = new SolidColorBrush(color);
+            if (res.TryGetValue(key, out var v) && v is SolidColorBrush b) b.Color = c;
+            else res[key] = new SolidColorBrush(c);
         }
 
         private void ApplyTheme()
@@ -197,62 +251,95 @@ namespace PriorityPulse
             RootGrid.Background = new SolidColorBrush(
                 _isDarkMode ? ColorHelper.FromArgb(160, 0, 0, 0) : ColorHelper.FromArgb(100, 245, 245, 250));
 
-            var paneColor = _isDarkMode
-                ? ColorHelper.FromArgb(248, 16, 16, 16)
-                : ColorHelper.FromArgb(248, 222, 222, 230);
+            var pane = _isDarkMode ? ColorHelper.FromArgb(252, 16, 16, 16) : ColorHelper.FromArgb(252, 222, 222, 230);
+            var paneDefault = _isDarkMode ? ColorHelper.FromArgb(250, 16, 16, 16) : ColorHelper.FromArgb(250, 222, 222, 230);
 
-            AppTitleBar.Background = new SolidColorBrush(paneColor);
+            AppTitleBar.Background = new SolidColorBrush(pane);
 
             var res = AppNavView.Resources;
-            SetBrush(res, "NavigationViewDefaultPaneBackground",
-                _isDarkMode ? ColorHelper.FromArgb(220, 16, 16, 16) : ColorHelper.FromArgb(220, 222, 222, 230));
-            SetBrush(res, "NavigationViewExpandedPaneBackground", paneColor);
-            SetBrush(res, "NavigationViewTopPaneBackground", paneColor);
+            SetBrush(res, "NavigationViewDefaultPaneBackground", paneDefault);
+            SetBrush(res, "NavigationViewExpandedPaneBackground", pane);
+            SetBrush(res, "NavigationViewTopPaneBackground", pane);
 
-            byte baseA = _isDarkMode ? (byte)255 : (byte)0;
-            SetBrush(res, "NavigationViewItemBackgroundPointerOver",        ColorHelper.FromArgb(_isDarkMode ? (byte)15 : (byte)25, baseA, baseA, baseA));
-            SetBrush(res, "NavigationViewItemBackgroundPressed",             ColorHelper.FromArgb(_isDarkMode ? (byte)5  : (byte)40, baseA, baseA, baseA));
-            SetBrush(res, "NavigationViewItemBackgroundSelected",            ColorHelper.FromArgb(_isDarkMode ? (byte)20 : (byte)15, baseA, baseA, baseA));
-            SetBrush(res, "NavigationViewItemBackgroundSelectedPointerOver", ColorHelper.FromArgb(_isDarkMode ? (byte)25 : (byte)30, baseA, baseA, baseA));
+            byte b0 = _isDarkMode ? (byte)255 : (byte)0;
+            SetBrush(res, "NavigationViewItemBackgroundPointerOver",        ColorHelper.FromArgb(_isDarkMode ? (byte)18 : (byte)28, b0, b0, b0));
+            SetBrush(res, "NavigationViewItemBackgroundPressed",             ColorHelper.FromArgb(_isDarkMode ? (byte)8  : (byte)42, b0, b0, b0));
+            SetBrush(res, "NavigationViewItemBackgroundSelected",            ColorHelper.FromArgb(_isDarkMode ? (byte)22 : (byte)18, b0, b0, b0));
+            SetBrush(res, "NavigationViewItemBackgroundSelectedPointerOver", ColorHelper.FromArgb(_isDarkMode ? (byte)28 : (byte)32, b0, b0, b0));
 
-            AppTitleText.Foreground    = TextPri;
-            AppSubtitleText.Foreground = TextSec;
-            PageTitleText.Foreground   = TextPri;
+            AppTitleText.Foreground     = TextPri;
+            AppSubtitleText.Foreground  = TextSec;
+            PageTitleText.Foreground    = TextPri;
             PageSubtitleText.Foreground = TextSec;
 
-            // Rebuild current page with new theme
             if (AppNavView.SelectedItem is NavigationViewItem sel)
                 NavigateTo(sel.Tag?.ToString() ?? "");
         }
 
-        // ── Page Transitions ──
+        // ── page transitions ──
         private async Task TransitionToPage(Action buildPage)
         {
-            var easeIn  = new CubicEase { EasingMode = EasingMode.EaseIn };
-            var easeOut = new CubicEase { EasingMode = EasingMode.EaseOut };
+            var eIn  = new CubicEase { EasingMode = EasingMode.EaseIn };
+            var eOut = new CubicEase { EasingMode = EasingMode.EaseOut };
 
             var sbOut = new Storyboard();
-            var fadeOut  = new DoubleAnimation { From = 1, To = 0, Duration = TimeSpan.FromMilliseconds(100), EasingFunction = easeIn };
-            var slideOut = new DoubleAnimation { From = 0, To = 6, Duration = TimeSpan.FromMilliseconds(100), EasingFunction = easeIn };
-            Storyboard.SetTarget(fadeOut, PageContentHost);       Storyboard.SetTargetProperty(fadeOut, "Opacity");
-            Storyboard.SetTarget(slideOut, PageContentTransform); Storyboard.SetTargetProperty(slideOut, "Y");
-            sbOut.Children.Add(fadeOut); sbOut.Children.Add(slideOut);
+            Anim(sbOut, PageContentHost, "Opacity", 1, 0, 80, eIn);
+            Anim(sbOut, PageContentTransform, "Y", 0, 8, 80, eIn);
+            Anim(sbOut, PageTitleText, "Opacity", 1, 0, 60, eIn);
+            Anim(sbOut, PageSubtitleText, "Opacity", 1, 0, 60, eIn);
             sbOut.Begin();
 
-            await Task.Delay(110);
+            await Task.Delay(90);
             buildPage();
-            PageContentTransform.Y = -6;
+
+            PageContentTransform.Y = -10;
+            PageTitleTransform.Y = -6;
+            PageSubtitleTransform.Y = -4;
 
             var sbIn = new Storyboard();
-            var fadeIn  = new DoubleAnimation { From = 0, To = 1, Duration = TimeSpan.FromMilliseconds(200), EasingFunction = easeOut };
-            var slideIn = new DoubleAnimation { From = -6, To = 0, Duration = TimeSpan.FromMilliseconds(200), EasingFunction = easeOut };
-            Storyboard.SetTarget(fadeIn, PageContentHost);       Storyboard.SetTargetProperty(fadeIn, "Opacity");
-            Storyboard.SetTarget(slideIn, PageContentTransform); Storyboard.SetTargetProperty(slideIn, "Y");
-            sbIn.Children.Add(fadeIn); sbIn.Children.Add(slideIn);
+            Anim(sbIn, PageTitleText, "Opacity", 0, 1, 250, eOut);
+            Anim(sbIn, PageTitleTransform, "Y", -6, 0, 250, eOut);
+            Anim(sbIn, PageSubtitleText, "Opacity", 0, 1, 200, eOut, 50);
+            Anim(sbIn, PageSubtitleTransform, "Y", -4, 0, 200, eOut, 50);
+            Anim(sbIn, PageContentHost, "Opacity", 0, 1, 280, eOut, 80);
+            Anim(sbIn, PageContentTransform, "Y", -10, 0, 280, eOut, 80);
             sbIn.Begin();
         }
 
-        // ── Navigation ──
+        // ── animation helpers ──
+        private static void Anim(Storyboard sb, DependencyObject target, string prop,
+            double from, double to, int ms, EasingFunctionBase ease, int delay = 0)
+        {
+            var a = new DoubleAnimation
+            {
+                From = from, To = to,
+                Duration = TimeSpan.FromMilliseconds(ms),
+                EasingFunction = ease
+            };
+            if (delay > 0) a.BeginTime = TimeSpan.FromMilliseconds(delay);
+            Storyboard.SetTarget(a, target);
+            Storyboard.SetTargetProperty(a, prop);
+            sb.Children.Add(a);
+        }
+
+        private void AnimateCardsIn()
+        {
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+            int delay = 0;
+            foreach (var child in PageContentHost.Children)
+            {
+                if (child is not Border card) continue;
+                card.Opacity = 0;
+                card.RenderTransform = new TranslateTransform { Y = 12 };
+                var sb = new Storyboard();
+                Anim(sb, card, "Opacity", 0, 1, 300, ease, delay);
+                Anim(sb, card.RenderTransform, "Y", 12, 0, 300, ease, delay);
+                sb.Begin();
+                delay += 60;
+            }
+        }
+
+        // ── navigation ──
         private void NavigateTo(string tag)
         {
             switch (tag)
@@ -261,6 +348,7 @@ namespace PriorityPulse
                 case "Console":   ShowConsolePage();   break;
                 case "Settings":  ShowSettingsPage();  break;
             }
+            AnimateCardsIn();
         }
 
         private void AppNavView_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -269,7 +357,7 @@ namespace PriorityPulse
                 _ = TransitionToPage(() => NavigateTo(tag));
         }
 
-        // ── Target App Page ──
+        // ── target app page ──
         private async void BrowseExeButton_Click(object s, RoutedEventArgs e)
         {
             var picker = new FileOpenPicker();
@@ -282,7 +370,8 @@ namespace PriorityPulse
                 _appCheckTimes[file.Name] = _defaultCheckMs;
                 AddLog($"Added: {file.Name}");
                 ShowTargetAppPage();
-                _ = SaveAppDataAsync();
+                AnimateCardsIn();
+                SaveAppData();
             }
         }
 
@@ -309,42 +398,37 @@ namespace PriorityPulse
                     row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-                    // App name
                     var label = MakeText(app);
                     label.VerticalAlignment = VerticalAlignment.Center;
                     row.Children.Add(label);
 
-                    // Priority dropdown
+                    // priority selector
                     string curPri = _appPriorities.GetValueOrDefault(app, "High");
                     var priBtn = MakeDropDown(curPri, 130);
                     priBtn.Margin = new Thickness(8, 0, 8, 0);
-                    priBtn.Flyout = BuildMenuFlyout(Priorities, sel =>
+                    priBtn.Flyout = BuildFlyout(Priorities, sel =>
                     {
-                        _appPriorities[app] = sel;
-                        priBtn.Content = sel;
-                        _handledPids.Clear();
-                        _ = SaveAppDataAsync();
+                        _appPriorities[app] = sel; priBtn.Content = sel;
+                        _handledPids.Clear(); SaveAppData();
                     });
                     Grid.SetColumn(priBtn, 1);
                     row.Children.Add(priBtn);
 
-                    // Check interval dropdown
+                    // check interval selector
                     int curMs = _appCheckTimes.GetValueOrDefault(app, 150);
                     string curLbl = CheckIntervals.FirstOrDefault(x => x.Ms == curMs).Label ?? "150ms";
                     var timeBtn = MakeDropDown(curLbl, 100);
                     timeBtn.Margin = new Thickness(0, 0, 8, 0);
-                    timeBtn.Flyout = BuildMenuFlyout(CheckIntervals.Select(x => x.Label).ToArray(), sel =>
+                    timeBtn.Flyout = BuildFlyout(CheckIntervals.Select(x => x.Label).ToArray(), sel =>
                     {
-                        int ms = CheckIntervals.First(x => x.Label == sel).Ms;
-                        _appCheckTimes[app] = ms;
-                        timeBtn.Content = sel;
-                        _ = SaveAppDataAsync();
+                        _appCheckTimes[app] = CheckIntervals.First(x => x.Label == sel).Ms;
+                        timeBtn.Content = sel; SaveAppData();
                     });
                     Grid.SetColumn(timeBtn, 2);
                     row.Children.Add(timeBtn);
 
-                    // Remove button
-                    var removeBtn = new Button
+                    // remove button
+                    var rmBtn = new Button
                     {
                         Content = "\u2715", Width = 32, Height = 32,
                         Background = new SolidColorBrush(Colors.Transparent),
@@ -355,42 +439,38 @@ namespace PriorityPulse
                             : ColorHelper.FromArgb(255, 200, 50, 50)),
                         FontFamily = _font
                     };
-                    Grid.SetColumn(removeBtn, 3);
+                    Grid.SetColumn(rmBtn, 3);
                     string captured = app;
-                    removeBtn.Click += (_, _) =>
+                    rmBtn.Click += (_, _) =>
                     {
-                        _targetApps.Remove(captured);
-                        _appPriorities.Remove(captured);
-                        _appCheckTimes.Remove(captured);
-                        _lastChecked.Remove(captured);
+                        _targetApps.Remove(captured); _appPriorities.Remove(captured);
+                        _appCheckTimes.Remove(captured); _lastChecked.Remove(captured);
                         AddLog($"Removed: {captured}");
-                        ShowTargetAppPage();
-                        _ = SaveAppDataAsync();
+                        ShowTargetAppPage(); AnimateCardsIn(); SaveAppData();
                     };
-                    row.Children.Add(removeBtn);
+                    row.Children.Add(rmBtn);
                     stack.Children.Add(row);
                 }
-
                 stack.Children.Add(new Border { Height = 1, Background = CardBorder, Margin = new Thickness(0, 4, 0, 4) });
             }
 
             var browseBtn = MakeButton("Browse");
             browseBtn.Click += BrowseExeButton_Click;
             stack.Children.Add(browseBtn);
-
             PageContentHost.Children.Add(WrapCard(stack));
         }
 
-        // ── Console Page ──
+        // ── console page ──
         private void ShowConsolePage()
         {
             PageTitleText.Text    = "Console";
             PageSubtitleText.Text = "Live log output.";
             PageContentHost.Children.Clear();
 
-            var stack = MakeStack();
+            // log entries
+            var logStack = MakeStack();
             if (_consoleLogs.Count == 0)
-                stack.Children.Add(MakeText("No activity yet."));
+                logStack.Children.Add(MakeText("No activity yet."));
             else
                 foreach (var (ts, msg) in _consoleLogs)
                 {
@@ -405,76 +485,96 @@ namespace PriorityPulse
                         Text = msg, Opacity = 0.85, Foreground = TextPri,
                         FontFamily = _font, FontSize = 12, VerticalAlignment = VerticalAlignment.Center
                     });
-                    stack.Children.Add(row);
+                    logStack.Children.Add(row);
                 }
+            PageContentHost.Children.Add(WrapCard(logStack));
 
-            PageContentHost.Children.Add(WrapCard(stack));
+            // log controls
+            var ctrlStack = MakeStack();
+            ctrlStack.Children.Add(MakeText(
+                $"{_consoleLogs.Count} log {(_consoleLogs.Count == 1 ? "entry" : "entries")} stored in memory."));
+            var clearBtn = MakeButton("Clear Logs");
+            clearBtn.Click += (_, _) => { _consoleLogs.Clear(); ShowConsolePage(); AnimateCardsIn(); };
+            ctrlStack.Children.Add(clearBtn);
+            PageContentHost.Children.Add(WrapCard(ctrlStack));
         }
 
-        // ── Settings Page ──
+        // ── settings page ──
         private void ShowSettingsPage()
         {
             PageTitleText.Text    = "Settings";
             PageSubtitleText.Text = "Adjust appearance and behavior.";
             PageContentHost.Children.Clear();
 
-            // Appearance
+            // appearance
             var appearStack = MakeStack();
             appearStack.Children.Add(MakeTitle("Appearance"));
             var themeToggle = MakeToggle("Light Mode", !_isDarkMode);
-            themeToggle.Toggled += (_, _) => { _isDarkMode = !themeToggle.IsOn; ApplyTheme(); };
+            themeToggle.Toggled += (_, _) => { _isDarkMode = !themeToggle.IsOn; ApplyTheme(); SaveSettings(); };
             appearStack.Children.Add(themeToggle);
             PageContentHost.Children.Add(WrapCard(appearStack));
 
-            // Behavior
+            // behavior
             var behavStack = MakeStack();
             behavStack.Children.Add(MakeTitle("Behavior"));
             var autoStart = MakeToggle("Start with Windows", GetAutoStart());
             autoStart.Toggled += (_, _) => SetAutoStart(autoStart.IsOn);
             behavStack.Children.Add(autoStart);
             var trayToggle = MakeToggle("Minimize to tray on close", _minimizeToTray);
-            trayToggle.Toggled += (_, _) => _minimizeToTray = trayToggle.IsOn;
+            trayToggle.Toggled += (_, _) => { _minimizeToTray = trayToggle.IsOn; SaveSettings(); };
             behavStack.Children.Add(trayToggle);
             PageContentHost.Children.Add(WrapCard(behavStack));
 
-            // Defaults for new apps
+            // defaults for new apps
             var defStack = MakeStack();
             defStack.Children.Add(MakeTitle("Defaults for New Apps"));
             defStack.Children.Add(MakeText("Applied automatically when you browse for an executable."));
 
             var defPriBtn = MakeDropDown(_defaultPriority, 130);
-            defPriBtn.Flyout = BuildMenuFlyout(Priorities, sel => { _defaultPriority = sel; defPriBtn.Content = sel; });
+            defPriBtn.Flyout = BuildFlyout(Priorities, sel =>
+            { _defaultPriority = sel; defPriBtn.Content = sel; SaveSettings(); });
             defStack.Children.Add(MakeLabeledRow("Priority", defPriBtn));
 
             string defTimeLbl = CheckIntervals.FirstOrDefault(x => x.Ms == _defaultCheckMs).Label ?? "150ms";
             var defTimeBtn = MakeDropDown(defTimeLbl, 100);
-            defTimeBtn.Flyout = BuildMenuFlyout(CheckIntervals.Select(x => x.Label).ToArray(), sel =>
+            defTimeBtn.Flyout = BuildFlyout(CheckIntervals.Select(x => x.Label).ToArray(), sel =>
             {
                 _defaultCheckMs = CheckIntervals.First(x => x.Label == sel).Ms;
-                defTimeBtn.Content = sel;
+                defTimeBtn.Content = sel; SaveSettings();
             });
             defStack.Children.Add(MakeLabeledRow("Check Interval", defTimeBtn));
             PageContentHost.Children.Add(WrapCard(defStack));
 
-            // Console info
+            // console auto-clear
             var consStack = MakeStack();
             consStack.Children.Add(MakeTitle("Console"));
-            consStack.Children.Add(MakeText($"{_consoleLogs.Count} log {(_consoleLogs.Count == 1 ? "entry" : "entries")} stored in memory."));
-            var clearBtn = MakeButton("Clear Logs");
-            clearBtn.Click += (_, _) => { _consoleLogs.Clear(); ShowSettingsPage(); };
-            consStack.Children.Add(clearBtn);
+            consStack.Children.Add(MakeText(
+                "Automatically clear log entries when the count exceeds the limit. \"Never\" keeps all entries until the app restarts."));
+
+            string curClearLbl = AutoClearOptions.FirstOrDefault(x => x.Count == _autoClearLimit).Label ?? "Never";
+            var clearBtn = MakeDropDown(curClearLbl, 150);
+            clearBtn.Flyout = BuildFlyout(AutoClearOptions.Select(x => x.Label).ToArray(), sel =>
+            {
+                _autoClearLimit = AutoClearOptions.First(x => x.Label == sel).Count;
+                clearBtn.Content = sel; SaveSettings();
+            });
+            consStack.Children.Add(MakeLabeledRow("Auto-clear after", clearBtn));
             PageContentHost.Children.Add(WrapCard(consStack));
         }
 
-        // ── Console Logging ──
+        // ── logging ──
         private void AddLog(string msg)
         {
+            if (_autoClearLimit > 0 && _consoleLogs.Count >= _autoClearLimit)
+                _consoleLogs.Clear();
+
             _consoleLogs.Add((DateTime.Now.ToString("HH:mm:ss"), msg));
+
             if (AppNavView.SelectedItem is NavigationViewItem { Tag: "Console" })
                 ShowConsolePage();
         }
 
-        // ── Background Process Tracker ──
+        // ── process tracker ──
         private async void StartTracker()
         {
             int cleanupTick = 0;
@@ -486,14 +586,12 @@ namespace PriorityPulse
                     {
                         var now = DateTime.UtcNow;
                         var due = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                         foreach (var app in _targetApps)
                         {
                             int interval = _appCheckTimes.GetValueOrDefault(app, 150);
                             if (!_lastChecked.TryGetValue(app, out var last) || (now - last).TotalMilliseconds >= interval)
-                            {
-                                due.Add(app);
-                                _lastChecked[app] = now;
-                            }
+                            { due.Add(app); _lastChecked[app] = now; }
                         }
 
                         if (due.Count > 0)
@@ -502,12 +600,8 @@ namespace PriorityPulse
                             {
                                 var procs = System.Diagnostics.Process.GetProcesses();
 
-                                // Clean dead PIDs every ~5s
                                 if (++cleanupTick >= 100)
-                                {
-                                    cleanupTick = 0;
-                                    _handledPids.IntersectWith(new HashSet<int>(procs.Select(p => p.Id)));
-                                }
+                                { cleanupTick = 0; _handledPids.IntersectWith(procs.Select(p => p.Id)); }
 
                                 foreach (var proc in procs)
                                 {
@@ -523,7 +617,6 @@ namespace PriorityPulse
                                         _             => System.Diagnostics.ProcessPriorityClass.Normal
                                     };
                                     _handledPids.Add(proc.Id);
-
                                     int pid = proc.Id;
                                     DispatcherQueue.TryEnqueue(() => AddLog($"Detected {name} (PID {pid}) \u2192 set to {pri}"));
                                 }
@@ -536,12 +629,12 @@ namespace PriorityPulse
             });
         }
 
-        // ── UI Factory Helpers ──
+        // ── ui helpers ──
         private Border WrapCard(UIElement content) => new()
         {
-            Background = CardBg, CornerRadius = new CornerRadius(16),
+            Background = CardBg, CornerRadius = new CornerRadius(14),
             Padding = new Thickness(24), BorderBrush = CardBorder,
-            BorderThickness = new Thickness(1), Margin = new Thickness(0, 0, 0, 12),
+            BorderThickness = new Thickness(1.5), Margin = new Thickness(0, 0, 0, 12),
             Child = content
         };
 
@@ -554,14 +647,12 @@ namespace PriorityPulse
         };
 
         private TextBlock MakeText(string t) => new()
-        {
-            Text = t, Opacity = 0.8, Foreground = TextPri, FontFamily = _font
-        };
+        { Text = t, Opacity = 0.8, Foreground = TextPri, FontFamily = _font };
 
         private Button MakeButton(string label) => new()
         {
             Content = label, Background = CardBg, Foreground = TextPri,
-            BorderBrush = CardBorder, BorderThickness = new Thickness(1),
+            BorderBrush = CardBorder, BorderThickness = new Thickness(1.5),
             CornerRadius = new CornerRadius(10), FontFamily = _font,
             Padding = new Thickness(16, 8, 16, 8)
         };
@@ -569,15 +660,13 @@ namespace PriorityPulse
         private DropDownButton MakeDropDown(string label, double width) => new()
         {
             Content = label, Width = width, CornerRadius = new CornerRadius(10),
-            Background = CardBg, BorderThickness = new Thickness(1),
+            Background = CardBg, BorderThickness = new Thickness(1.5),
             BorderBrush = CardBorder, Foreground = TextPri,
             FontFamily = _font, VerticalAlignment = VerticalAlignment.Center
         };
 
         private ToggleSwitch MakeToggle(string header, bool isOn) => new()
-        {
-            Header = header, IsOn = isOn, Foreground = TextPri, FontFamily = _font
-        };
+        { Header = header, IsOn = isOn, Foreground = TextPri, FontFamily = _font };
 
         private StackPanel MakeLabeledRow(string label, UIElement control)
         {
@@ -591,7 +680,7 @@ namespace PriorityPulse
             return row;
         }
 
-        private MenuFlyout BuildMenuFlyout(string[] options, Action<string> onSelect)
+        private MenuFlyout BuildFlyout(string[] options, Action<string> onSelect)
         {
             var flyout = new MenuFlyout();
             foreach (var opt in options)
