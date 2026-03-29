@@ -5,14 +5,14 @@ namespace PriorityPulse
 {
     internal sealed class TrayIcon : IDisposable
     {
-        // ── Win32 Constants ──
+        // win32 constants
         private const int WM_TRAY = 0x8001, NIM_ADD = 0, NIM_DELETE = 2;
         private const int NIF_MESSAGE = 0x1, NIF_ICON = 0x2, NIF_TIP = 0x4;
         private const int WM_LBUTTONDBLCLK = 0x203, WM_RBUTTONUP = 0x205;
         private const uint MF_STRING = 0x0, MF_SEPARATOR = 0x800;
         private const uint TPM_RETURNCMD = 0x100, TPM_RIGHTBUTTON = 0x2;
 
-        // ── Win32 Structs ──
+        // win32 structs
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct NOTIFYICONDATA
         {
@@ -41,7 +41,7 @@ namespace PriorityPulse
         [StructLayout(LayoutKind.Sequential)]
         private struct BITMAPINFO { public BITMAPINFOHEADER bmiHeader; public uint bmiColors; }
 
-        // ── Win32 Imports ──
+        // win32 imports
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern bool Shell_NotifyIcon(int msg, ref NOTIFYICONDATA d);
         [DllImport("user32.dll")] private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int idx, IntPtr v);
@@ -63,7 +63,7 @@ namespace PriorityPulse
 
         private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
 
-        // ── State ──
+        // state
         private readonly IntPtr _hwnd;
         private readonly WndProcDelegate _wndProc;
         private readonly IntPtr _oldWndProc;
@@ -74,7 +74,7 @@ namespace PriorityPulse
         public event Action? ShowRequested;
         public event Action? ExitRequested;
 
-        // ── Initialization ──
+        // init
         public TrayIcon(IntPtr hwnd, string tooltip)
         {
             _hwnd = hwnd;
@@ -92,7 +92,7 @@ namespace PriorityPulse
             _oldWndProc = SetWindowLongPtr(hwnd, -4, Marshal.GetFunctionPointerForDelegate(_wndProc));
         }
 
-        // ── Icon Rendering (gear + sonar arcs, pure GDI) ──
+        // icon render — gear + sonar arcs, pure GDI
         private static IntPtr BuildIcon()
         {
             const int S = 32;
@@ -103,7 +103,7 @@ namespace PriorityPulse
 
             uint bg = Premul(0x18, 0x18, 0x18);
 
-            // Rounded-rect background
+            // rounded-rect background
             const int RR = 5;
             for (int y = 0; y < S; y++)
                 for (int x = 0; x < S; x++)
@@ -115,7 +115,7 @@ namespace PriorityPulse
                     px[y * S + x] = corner && d > RR ? 0u : bg;
                 }
 
-            // Gear body + teeth
+            // gear body + teeth
             double gcx = 11.5, gcy = 15.5, holeR = 2.8, bodyR = 6.2, toothR = 8.2;
             double seg = 2.0 * Math.PI / 6, toothFrac = 0.45;
 
@@ -131,13 +131,13 @@ namespace PriorityPulse
                         px[y * S + x] = Premul(0xFF, 0xFF, 0xFF, (byte)(alpha * 255));
                 }
 
-            // Gear center hole
+            // gear center hole
             for (int y = 0; y < S; y++)
                 for (int x = 0; x < S; x++)
                     if (Math.Sqrt((x - gcx) * (x - gcx) + (y - gcy) * (y - gcy)) < holeR - 0.5)
                         px[y * S + x] = bg;
 
-            // Sonar arcs
+            // sonar arcs
             double arcMin = -Math.PI * 0.32, arcMax = Math.PI * 0.32, arcThick = 0.85;
             foreach (double R in new[] { 11.5, 15.5, 19.5 })
                 for (int y = 0; y < S; y++)
@@ -160,7 +160,7 @@ namespace PriorityPulse
             return PixelsToHIcon(px, S);
         }
 
-        // ── Pixel array → HICON conversion ──
+        // pixel array to HICON
         private static IntPtr PixelsToHIcon(uint[] px, int S)
         {
             var bmi = new BITMAPINFO
@@ -176,8 +176,7 @@ namespace PriorityPulse
             if (bits != IntPtr.Zero)
                 Marshal.Copy(Array.ConvertAll(px, p => (int)p), 0, bits, px.Length);
 
-            int stride = ((S + 15) / 16) * 2;
-            var gc = GCHandle.Alloc(new byte[stride * S], GCHandleType.Pinned);
+            var gc = GCHandle.Alloc(new byte[((S + 15) / 16) * 2 * S], GCHandleType.Pinned);
             IntPtr hMask = CreateBitmap(S, S, 1, 1, gc.AddrOfPinnedObject());
             gc.Free();
 
@@ -187,7 +186,7 @@ namespace PriorityPulse
             return hIcon;
         }
 
-        // ── Tray click + context menu handling ──
+        // tray click + context menu
         private IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr w, IntPtr l)
         {
             if (msg == WM_TRAY)
@@ -212,7 +211,7 @@ namespace PriorityPulse
             return CallWindowProc(_oldWndProc, hWnd, msg, w, l);
         }
 
-        // ── Cleanup ──
+        // cleanup
         public void Dispose()
         {
             Shell_NotifyIcon(NIM_DELETE, ref _nid);
