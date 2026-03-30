@@ -29,6 +29,11 @@ namespace PriorityPulse
         private readonly Dictionary<string, DateTime>  _lastChecked   = new(StringComparer.OrdinalIgnoreCase);
         private readonly FontFamily                    _font          = new("Segoe UI Variable Display");
 
+        // status indicator tracking
+        private readonly Dictionary<string, Microsoft.UI.Xaml.Shapes.Ellipse> _statusDots = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string>               _runningApps   = new(StringComparer.OrdinalIgnoreCase);
+        private DispatcherTimer?                        _statusTimer;
+
         private bool   _isDarkMode      = true;
         private bool   _minimizeToTray  = true;
         private string _defaultPriority = "High";
@@ -37,7 +42,8 @@ namespace PriorityPulse
         private TrayIcon? _trayIcon;
 
         // ── constants ──
-        private static readonly string[] Priorities = { "Normal", "AboveNormal", "High" };
+        private static readonly string[] Priorities =
+            { "Low", "BelowNormal", "Normal", "AboveNormal", "High", "Realtime" };
 
         private static readonly (string Label, int Ms)[] CheckIntervals =
         {
@@ -79,6 +85,12 @@ namespace PriorityPulse
             public int    AutoClearLimit  { get; set; } = 0;
         }
 
+        private class ExportData
+        {
+            public Dictionary<string, AppConfig>? Apps { get; set; }
+            public SettingsData? Settings { get; set; }
+        }
+
         // ── init ──
         public MainWindow()
         {
@@ -106,6 +118,7 @@ namespace PriorityPulse
             AppNavView.SelectedItem = AppNavView.MenuItems[0];
             ShowTargetAppPage();
             StartTracker();
+            StartStatusTimer();
 
             AppWindow.Closing += (_, e) =>
             {
@@ -212,7 +225,91 @@ namespace PriorityPulse
             catch { }
         }
 
-        // ── auto-start ──
+        // ── export / import ──
+        private async void ExportSettings_Click(object s, RoutedEventArgs e)
+        {
+            var picker = new FileSavePicker();
+            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+            picker.SuggestedStartLocation = PickerLocationId.Desktop;
+            picker.SuggestedFileName = "PriorityPulse-Config";
+            picker.FileTypeChoices.Add("JSON", new[] { ".json" });
+
+            var file = await picker.PickSaveFileAsync();
+            if (file == null) return;
+
+            var export = new ExportData
+            {
+                Apps = _targetApps.ToDictionary(a => a, a => new AppConfig
+                {
+                    Priority = _appPriorities.GetValueOrDefault(a, "High"),
+                    CheckMs  = _appCheckTimes.GetValueOrDefault(a, 150)
+                }),
+                Settings = new SettingsData
+                {
+                    IsDarkMode      = _isDarkMode,
+                    MinimizeToTray  = _minimizeToTray,
+                    DefaultPriority = _defaultPriority,
+                    DefaultCheckMs  = _defaultCheckMs,
+                    AutoClearLimit  = _autoClearLimit
+                }
+            };
+
+            var json = JsonSerializer.Serialize(export, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(file.Path, json);
+            AddLog("Settings exported");
+        }
+
+        private async void ImportSettings_Click(object s, RoutedEventArgs e)
+        {
+            var picker = new FileOpenPicker();
+            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+            picker.FileTypeFilter.Add(".json");
+
+            var file = await picker.PickSingleFileAsync();
+            if (file == null) return;
+
+            try
+            {
+                var json = File.ReadAllText(file.Path);
+                var import = JsonSerializer.Deserialize<ExportData>(json);
+                if (import == null) return;
+
+                // apply apps
+                if (import.Apps != null)
+                {
+                    _targetApps.Clear();
+                    _appPriorities.Clear();
+                    _appCheckTimes.Clear();
+                    _handledPids.Clear();
+                    foreach (var (name, cfg) in import.Apps)
+                    {
+                        _targetApps.Add(name);
+                        _appPriorities[name] = cfg.Priority;
+                        _appCheckTimes[name] = cfg.CheckMs;
+                    }
+                    SaveAppData();
+                }
+
+                // apply settings
+                if (import.Settings is SettingsData st)
+                {
+                    _isDarkMode      = st.IsDarkMode;
+                    _minimizeToTray  = st.MinimizeToTray;
+                    _defaultPriority = st.DefaultPriority;
+                    _defaultCheckMs  = st.DefaultCheckMs;
+                    _autoClearLimit  = st.AutoClearLimit;
+                    SaveSettings();
+                    ApplyTheme();
+                }
+
+                AddLog("Settings imported");
+                ShowSettingsPage();
+                AnimateCardsIn();
+            }
+            catch { AddLog("Import failed — invalid file"); }
+        }
+
+        // ── auto-start (with --minimized flag) ──
         private bool GetAutoStart()
         {
             try { using var k = Registry.CurrentUser.OpenSubKey(RegPath); return k?.GetValue(RegKeyName) != null; }
@@ -224,10 +321,46 @@ namespace PriorityPulse
             try
             {
                 using var k = Registry.CurrentUser.OpenSubKey(RegPath, writable: true);
-                if (enable) { var exe = Environment.ProcessPath; if (exe != null) k?.SetValue(RegKeyName, exe); }
+                if (enable)
+                {
+                    var exe = Environment.ProcessPath;
+                    if (exe != null) k?.SetValue(RegKeyName, $"\"{exe}\" --minimized");
+                }
                 else k?.DeleteValue(RegKeyName, throwOnMissingValue: false);
             }
             catch { }
+        }
+
+        // ── status indicator timer ──
+        private void StartStatusTimer()
+        {
+            _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            _statusTimer.Tick += (_, _) => RefreshStatusDots();
+            _statusTimer.Start();
+        }
+
+        private void RefreshStatusDots()
+        {
+            if (_statusDots.Count == 0) return;
+
+            _runningApps.Clear();
+            try
+            {
+                foreach (var proc in System.Diagnostics.Process.GetProcesses())
+                {
+                    string name = proc.ProcessName + ".exe";
+                    if (_targetApps.Contains(name))
+                        _runningApps.Add(name);
+                }
+            }
+            catch { }
+
+            foreach (var (app, dot) in _statusDots)
+            {
+                dot.Fill = new SolidColorBrush(_runningApps.Contains(app)
+                    ? ColorHelper.FromArgb(255, 0, 200, 80)
+                    : ColorHelper.FromArgb(60, 255, 255, 255));
+            }
         }
 
         // ── theme ──
@@ -342,6 +475,7 @@ namespace PriorityPulse
         // ── navigation ──
         private void NavigateTo(string tag)
         {
+            _statusDots.Clear();
             switch (tag)
             {
                 case "TargetApp": ShowTargetAppPage(); break;
@@ -380,6 +514,7 @@ namespace PriorityPulse
             PageTitleText.Text    = "Target App";
             PageSubtitleText.Text = "Choose which executables to monitor.";
             PageContentHost.Children.Clear();
+            _statusDots.Clear();
 
             var stack = MakeStack();
             stack.Children.Add(MakeTitle("Monitored Applications"));
@@ -393,25 +528,36 @@ namespace PriorityPulse
                 foreach (var app in _targetApps)
                 {
                     var row = new Grid { Margin = new Thickness(0, 2, 0, 2) };
+                    row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                     row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
                     row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
+                    // status dot
+                    var dot = new Microsoft.UI.Xaml.Shapes.Ellipse
+                    {
+                        Width = 8, Height = 8,
+                        Fill = new SolidColorBrush(ColorHelper.FromArgb(60, 255, 255, 255)),
+                        VerticalAlignment = VerticalAlignment.Center,
+                        Margin = new Thickness(0, 0, 10, 0)
+                    };
+                    Grid.SetColumn(dot, 0);
+                    row.Children.Add(dot);
+                    _statusDots[app] = dot;
+
+                    // app name
                     var label = MakeText(app);
                     label.VerticalAlignment = VerticalAlignment.Center;
+                    Grid.SetColumn(label, 1);
                     row.Children.Add(label);
 
                     // priority selector
                     string curPri = _appPriorities.GetValueOrDefault(app, "High");
                     var priBtn = MakeDropDown(curPri, 130);
                     priBtn.Margin = new Thickness(8, 0, 8, 0);
-                    priBtn.Flyout = BuildFlyout(Priorities, sel =>
-                    {
-                        _appPriorities[app] = sel; priBtn.Content = sel;
-                        _handledPids.Clear(); SaveAppData();
-                    });
-                    Grid.SetColumn(priBtn, 1);
+                    priBtn.Flyout = BuildPriorityFlyout(app, priBtn);
+                    Grid.SetColumn(priBtn, 2);
                     row.Children.Add(priBtn);
 
                     // check interval selector
@@ -424,7 +570,7 @@ namespace PriorityPulse
                         _appCheckTimes[app] = CheckIntervals.First(x => x.Label == sel).Ms;
                         timeBtn.Content = sel; SaveAppData();
                     });
-                    Grid.SetColumn(timeBtn, 2);
+                    Grid.SetColumn(timeBtn, 3);
                     row.Children.Add(timeBtn);
 
                     // remove button
@@ -439,7 +585,7 @@ namespace PriorityPulse
                             : ColorHelper.FromArgb(255, 200, 50, 50)),
                         FontFamily = _font
                     };
-                    Grid.SetColumn(rmBtn, 3);
+                    Grid.SetColumn(rmBtn, 4);
                     string captured = app;
                     rmBtn.Click += (_, _) =>
                     {
@@ -458,6 +604,71 @@ namespace PriorityPulse
             browseBtn.Click += BrowseExeButton_Click;
             stack.Children.Add(browseBtn);
             PageContentHost.Children.Add(WrapCard(stack));
+
+            // immediately refresh dots
+            RefreshStatusDots();
+        }
+
+        // ── priority flyout with realtime warning ──
+        private MenuFlyout BuildPriorityFlyout(string app, DropDownButton btn)
+        {
+            var flyout = new MenuFlyout();
+            foreach (var pri in Priorities)
+            {
+                var item = new MenuFlyoutItem { Text = pri, FontFamily = _font };
+                string p = pri;
+                item.Click += async (_, _) =>
+                {
+                    if (p == "Realtime")
+                    {
+                        var dialog = new ContentDialog
+                        {
+                            Title = "Realtime Priority",
+                            Content = "Setting a process to Realtime can make your system unresponsive or freeze entirely. Only use this if you understand the risk.",
+                            PrimaryButtonText = "Set Anyway",
+                            CloseButtonText = "Cancel",
+                            XamlRoot = PageContentHost.XamlRoot
+                        };
+                        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+                    }
+                    _appPriorities[app] = p;
+                    btn.Content = p;
+                    _handledPids.Clear();
+                    SaveAppData();
+                };
+                flyout.Items.Add(item);
+            }
+            return flyout;
+        }
+
+        private MenuFlyout BuildDefaultPriorityFlyout(DropDownButton btn)
+        {
+            var flyout = new MenuFlyout();
+            foreach (var pri in Priorities)
+            {
+                var item = new MenuFlyoutItem { Text = pri, FontFamily = _font };
+                string p = pri;
+                item.Click += async (_, _) =>
+                {
+                    if (p == "Realtime")
+                    {
+                        var dialog = new ContentDialog
+                        {
+                            Title = "Realtime Priority",
+                            Content = "Setting the default to Realtime means all new apps will be set to Realtime priority. This can make your system unresponsive.",
+                            PrimaryButtonText = "Set Anyway",
+                            CloseButtonText = "Cancel",
+                            XamlRoot = PageContentHost.XamlRoot
+                        };
+                        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+                    }
+                    _defaultPriority = p;
+                    btn.Content = p;
+                    SaveSettings();
+                };
+                flyout.Items.Add(item);
+            }
+            return flyout;
         }
 
         // ── console page ──
@@ -517,7 +728,7 @@ namespace PriorityPulse
             // behavior
             var behavStack = MakeStack();
             behavStack.Children.Add(MakeTitle("Behavior"));
-            var autoStart = MakeToggle("Start with Windows", GetAutoStart());
+            var autoStart = MakeToggle("Start with Windows (minimized to tray)", GetAutoStart());
             autoStart.Toggled += (_, _) => SetAutoStart(autoStart.IsOn);
             behavStack.Children.Add(autoStart);
             var trayToggle = MakeToggle("Minimize to tray on close", _minimizeToTray);
@@ -531,8 +742,7 @@ namespace PriorityPulse
             defStack.Children.Add(MakeText("Applied automatically when you browse for an executable."));
 
             var defPriBtn = MakeDropDown(_defaultPriority, 130);
-            defPriBtn.Flyout = BuildFlyout(Priorities, sel =>
-            { _defaultPriority = sel; defPriBtn.Content = sel; SaveSettings(); });
+            defPriBtn.Flyout = BuildDefaultPriorityFlyout(defPriBtn);
             defStack.Children.Add(MakeLabeledRow("Priority", defPriBtn));
 
             string defTimeLbl = CheckIntervals.FirstOrDefault(x => x.Ms == _defaultCheckMs).Label ?? "150ms";
@@ -560,6 +770,21 @@ namespace PriorityPulse
             });
             consStack.Children.Add(MakeLabeledRow("Auto-clear after", clearBtn));
             PageContentHost.Children.Add(WrapCard(consStack));
+
+            // export / import
+            var ioStack = MakeStack();
+            ioStack.Children.Add(MakeTitle("Export / Import"));
+            ioStack.Children.Add(MakeText("Save or load your app list and settings as a portable config file."));
+
+            var btnRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+            var exportBtn = MakeButton("Export");
+            exportBtn.Click += ExportSettings_Click;
+            btnRow.Children.Add(exportBtn);
+            var importBtn = MakeButton("Import");
+            importBtn.Click += ImportSettings_Click;
+            btnRow.Children.Add(importBtn);
+            ioStack.Children.Add(btnRow);
+            PageContentHost.Children.Add(WrapCard(ioStack));
         }
 
         // ── logging ──
@@ -612,8 +837,11 @@ namespace PriorityPulse
                                     string pri = _appPriorities.GetValueOrDefault(name, "High");
                                     proc.PriorityClass = pri switch
                                     {
+                                        "Realtime"    => System.Diagnostics.ProcessPriorityClass.RealTime,
                                         "High"        => System.Diagnostics.ProcessPriorityClass.High,
                                         "AboveNormal" => System.Diagnostics.ProcessPriorityClass.AboveNormal,
+                                        "BelowNormal" => System.Diagnostics.ProcessPriorityClass.BelowNormal,
+                                        "Low"         => System.Diagnostics.ProcessPriorityClass.Idle,
                                         _             => System.Diagnostics.ProcessPriorityClass.Normal
                                     };
                                     _handledPids.Add(proc.Id);
