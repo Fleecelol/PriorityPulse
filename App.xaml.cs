@@ -17,13 +17,19 @@ namespace PriorityPulse
             _mutex = new Mutex(true, "PriorityPulse_SingleInstance", out bool isNew);
             if (!isNew)
             {
-                // another instance is already running
                 Environment.Exit(0);
                 return;
             }
 
             _window = new MainWindow();
             _window.Activate();
+
+            // startup minimized — hide to tray immediately
+            if (Environment.GetCommandLineArgs().Length > 1 &&
+                Array.Exists(Environment.GetCommandLineArgs(), a => a == "--minimized"))
+            {
+                _window.AppWindow.Hide();
+            }
         }
     }
 }
